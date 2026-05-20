@@ -64,8 +64,8 @@ class Env
     public static function load(string $file): void
     {
         if (!file_exists($file)) {
-            Logger::error(".env niet gevonden: $file");
-            exit(1);
+            Logger::info(".env niet gevonden ($file) — omgevingsvariabelen worden gebruikt");
+            return;
         }
         foreach (file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
             $line = trim($line);
