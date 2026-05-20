@@ -420,13 +420,23 @@ class WooCommerceApi
         return ['updated' => $succeeded, 'errors' => $errors];
     }
 
-    public static function buildCreatePayload(array $p, float $price, string $priceField): array
+    private static function fakePrices(float $price): array
     {
+        $discountPct  = (float)Env::get('FAKE_DISCOUNT_PCT', '10');
+        $regularPrice = $discountPct > 0 ? round($price * (1 + $discountPct / 100), 2) : $price;
+        return ['regular' => (string)$regularPrice, 'sale' => (string)$price];
+    }
+
+    public static function buildCreatePayload(array $p, float $price): array
+    {
+        $prices  = self::fakePrices($price);
         $payload = [
             'name'               => $p['name'] !== '' ? $p['name'] : $p['sku'],
             'sku'                => $p['sku'],
             'status'             => 'draft',
             'catalog_visibility' => 'visible',
+            'regular_price'      => $prices['regular'],
+            'sale_price'         => $prices['sale'],
             'meta_data'          => [
                 ['key' => '_solar_sap_number', 'value' => $p['sap']],
                 ['key' => '_solar_last_sync',  'value' => date('Y-m-d H:i:s')],
@@ -447,17 +457,17 @@ class WooCommerceApi
         if (!empty($attrs)) $payload['attributes'] = $attrs;
         if (!empty($p['images'])) $payload['images'] = array_map(fn($url) => ['src' => $url], $p['images']);
 
-        $payload[$priceField === 'sale' ? 'sale_price' : 'regular_price'] = (string)$price;
-
         return $payload;
     }
 
-    public static function buildUpdatePayload(int $wcId, float $price, string $priceField): array
+    public static function buildUpdatePayload(int $wcId, float $price): array
     {
+        $prices = self::fakePrices($price);
         return [
-            'id'        => $wcId,
-            'meta_data' => [['key' => '_solar_last_sync', 'value' => date('Y-m-d H:i:s')]],
-            $priceField === 'sale' ? 'sale_price' : 'regular_price' => (string)$price,
+            'id'            => $wcId,
+            'regular_price' => $prices['regular'],
+            'sale_price'    => $prices['sale'],
+            'meta_data'     => [['key' => '_solar_last_sync', 'value' => date('Y-m-d H:i:s')]],
         ];
     }
 }
@@ -536,13 +546,11 @@ class Sync
 {
     private SkuCache  $cache;
     private SyncState $state;
-    private string    $priceField;
 
     public function __construct()
     {
-        $this->cache      = new SkuCache();
-        $this->state      = new SyncState();
-        $this->priceField = Env::get('PRICE_FIELD', 'regular');
+        $this->cache  = new SkuCache();
+        $this->state  = new SyncState();
     }
 
     public function run(): void
@@ -609,9 +617,9 @@ class Sync
                 $wcId = $this->cache->getId($p['sku']);
 
                 if ($wcId) {
-                    $toUpdate[] = WooCommerceApi::buildUpdatePayload($wcId, $price, $this->priceField);
+                    $toUpdate[] = WooCommerceApi::buildUpdatePayload($wcId, $price);
                 } else {
-                    $toCreate[] = WooCommerceApi::buildCreatePayload($p, $price, $this->priceField);
+                    $toCreate[] = WooCommerceApi::buildCreatePayload($p, $price);
                 }
             }
 
@@ -642,7 +650,7 @@ class Sync
                         $id = WooCommerceApi::getIdBySku($sku);
                         if ($id) {
                             $this->cache->set($sku, $id, $productMap[$sku]['p']['last_changed'] ?? 0);
-                            $retry[] = WooCommerceApi::buildUpdatePayload($id, $productMap[$sku]['price'], $this->priceField);
+                            $retry[] = WooCommerceApi::buildUpdatePayload($id, $productMap[$sku]['price']);
                         } else {
                             $pageErrors++;
                             Logger::warn("  SKU $sku: duplicate maar niet gevonden in WC");
