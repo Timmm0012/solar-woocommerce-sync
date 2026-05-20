@@ -77,7 +77,7 @@ class Env
 
     public static function get(string $key, string $default = ''): string
     {
-        return $_ENV[$key] ?? $default;
+        return $_ENV[$key] ?? (getenv($key) ?: $default);
     }
 
     public static function require(string ...$keys): void
