@@ -1,0 +1,4 @@
+.env
+sku_cache.json
+state.json
+sync.log

@@ -1,2 +1,20 @@
-[2026-05-19 20:18:41] INFO      Solar: token ophalen...
-[2026-05-19 20:18:43] OK        Solar: token ontvangen (geldig tot 21:18:43)
+
+=== Solar → WooCommerce Sync ===
+[2026-05-20 11:40:06] INFO      Catalog : 3016429  Land: NL
+[2026-05-20 11:40:06] INFO      WC URL  : https://pricescout.nl
+[2026-05-20 11:40:06] INFO      Cache   : 60 bekende producten
+[2026-05-20 11:40:06] INFO      Solar: token ophalen...
+[2026-05-20 11:40:09] OK        Solar: token ontvangen (geldig tot 12:40:09)
+
+=== Sync gestart ===
+[2026-05-20 11:40:09] INFO      Pagina 1 ophalen...
+[2026-05-20 11:40:23] INFO      74 actieve producten
+[2026-05-20 11:40:23] INFO      Prijzen ophalen voor 74 producten...
+[2026-05-20 11:40:28] INFO      Prijzen ontvangen: 74 / 74
+[2026-05-20 11:40:28] INFO        Create batch 1/1 (14 stuks)
+[2026-05-20 11:41:06] INFO        Update batch 1/2 (50 stuks)
+[2026-05-20 11:41:17] INFO        Update batch 2/2 (10 stuks)
+[2026-05-20 11:41:20] OK        Pagina 1 — aangemaakt: 14  bijgewerkt: 60
+[2026-05-20 11:41:20] INFO      Pagina 2 ophalen...
+[2026-05-20 11:41:25] INFO      614 actieve producten
+[2026-05-20 11:41:25] INFO      Prijzen ophalen voor 614 producten...
