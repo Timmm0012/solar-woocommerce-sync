@@ -2,9 +2,7 @@
 <?php
 declare(strict_types=1);
 
-// 
-
-normale run (hervat als state.json bestaat)
+// php sync.php          normale run (hervat als state.json bestaat)
 // php sync.php --reset  opnieuw beginnen (wist state, cache en log)
 // php sync.php --dump   print alle raw velden van het eerste Solar product
 
@@ -17,6 +15,7 @@ const PRICE_BATCH     = 50;
 const WC_BATCH        = 50;
 const PAGE_LIMIT      = 1000;
 const MAX_ERRORS      = 3;
+const PRODUCTS_FILE   = __DIR__ . '/products.json';
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -141,8 +140,11 @@ class Http
 
 class SolarApi
 {
-    private static string $token   = '';
-    private static int    $expires = 0;
+    private static string $token           = '';
+    private static int    $expires         = 0;
+    private static int    $lastErrorStatus = 0;
+
+    public static function getLastErrorStatus(): int { return self::$lastErrorStatus; }
 
     public static function token(): string
     {
@@ -225,9 +227,11 @@ class SolarApi
         $bodyRaw    = substr($response, $headerSize);
 
         if ($status < 200 || $status >= 300) {
+            self::$lastErrorStatus = $status;
             Logger::error("Solar HTTP $status: " . substr($bodyRaw, 0, 300));
             return null;
         }
+        self::$lastErrorStatus = 0;
 
         $next = null;
         if (preg_match('/[?&]nextpage=([^&>\s]+)/i', $headersRaw, $m)) {
