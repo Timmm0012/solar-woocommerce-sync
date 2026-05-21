@@ -15,6 +15,7 @@ const PRICE_BATCH     = 50;
 const WC_BATCH        = 50;
 const PAGE_LIMIT      = 1000;
 const MAX_ERRORS      = 3;
+const PRODUCTS_FILE   = __DIR__ . '/products.json';
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -139,8 +140,11 @@ class Http
 
 class SolarApi
 {
-    private static string $token   = '';
-    private static int    $expires = 0;
+    private static string $token           = '';
+    private static int    $expires         = 0;
+    private static int    $lastErrorStatus = 0;
+
+    public static function getLastErrorStatus(): int { return self::$lastErrorStatus; }
 
     public static function token(): string
     {
@@ -223,9 +227,11 @@ class SolarApi
         $bodyRaw    = substr($response, $headerSize);
 
         if ($status < 200 || $status >= 300) {
+            self::$lastErrorStatus = $status;
             Logger::error("Solar HTTP $status: " . substr($bodyRaw, 0, 300));
             return null;
         }
+        self::$lastErrorStatus = 0;
 
         $next = null;
         if (preg_match('/[?&]nextpage=([^&>\s]+)/i', $headersRaw, $m)) {
@@ -523,6 +529,8 @@ class SyncState
         return [
             'nextpage'           => null,
             'page'               => 0,
+            'fetch_done'         => false,
+            'wc_offset'          => 0,
             'created'            => 0,
             'updated'            => 0,
             'skipped'            => 0,
@@ -549,37 +557,52 @@ class Sync
 
     public function __construct()
     {
-        $this->cache  = new SkuCache();
-        $this->state  = new SyncState();
+        $this->cache = new SkuCache();
+        $this->state = new SyncState();
     }
 
-    public function run(): void
-    {
-        Logger::info('Catalog : ' . Env::get('CATALOG_ID') . '  Land: ' . Env::get('COUNTRY_CODE'));
-        Logger::info('WC URL  : ' . Env::get('WC_URL'));
-        Logger::info('Cache   : ' . $this->cache->count() . ' bekende producten');
+    // ── Fase 1: haal alle Solar pagina's op zonder WC-vertraging ─────────────
 
-        if ($this->state->get('page') > 0) {
-            Logger::ok('Hervatten vanaf pagina ' . $this->state->get('page'));
+    private function fetchAllProducts(): bool
+    {
+        Logger::section('Fase 1: Solar producten ophalen');
+
+        $allProducts = [];
+
+        if ($this->state->get('page') > 0 && file_exists(PRODUCTS_FILE)) {
+            $allProducts = json_decode(file_get_contents(PRODUCTS_FILE), true) ?? [];
+            Logger::ok('Hervatten vanaf pagina ' . ($this->state->get('page') + 1) . ' (' . count($allProducts) . ' al geladen)');
         }
 
-        SolarApi::token();
-        Logger::section('Sync gestart');
-
         while (true) {
-            $pageNum = $this->state->get('page') + 1;
-            Logger::info("Pagina $pageNum ophalen...");
+            $pageNum    = $this->state->get('page') + 1;
+            Logger::info("Solar pagina $pageNum ophalen...");
 
             $pageResult = SolarApi::getPage($this->state->get('nextpage'));
 
             if ($pageResult === null) {
+                $httpStatus = SolarApi::getLastErrorStatus();
+
+                // Cursor verlopen (HTTP 400) → opnieuw beginnen vanaf pagina 1
+                if ($httpStatus === 400 && $this->state->get('nextpage') !== null) {
+                    Logger::warn('nextpage cursor verlopen — opnieuw beginnen vanaf pagina 1...');
+                    $allProducts = [];
+                    $this->state->set('page', 0);
+                    $this->state->set('nextpage', null);
+                    $this->state->set('consecutive_errors', 0);
+                    $this->state->save();
+                    @unlink(PRODUCTS_FILE);
+                    continue;
+                }
+
                 $this->state->inc('consecutive_errors');
                 $this->state->save();
                 $errors = $this->state->get('consecutive_errors');
                 Logger::error("Pagina $pageNum mislukt ($errors/" . MAX_ERRORS . ')');
+
                 if ($errors >= MAX_ERRORS) {
-                    Logger::error('Maximum fouten bereikt — sync gestopt.');
-                    break;
+                    Logger::error('Solar niet bereikbaar na ' . MAX_ERRORS . ' pogingen — sync gestopt.');
+                    return false;
                 }
                 Logger::warn('60s wachten voor retry...');
                 sleep(60);
@@ -587,29 +610,54 @@ class Sync
             }
 
             [$products, $nextpage] = $pageResult;
+            $allProducts = array_merge($allProducts, $products);
 
             $this->state->set('page', $pageNum);
             $this->state->set('nextpage', $nextpage);
             $this->state->set('consecutive_errors', 0);
             $this->state->save();
 
-            $active = count($products);
-            Logger::info("$active actieve producten" . ($nextpage ? '' : '  (laatste pagina)'));
+            file_put_contents(PRODUCTS_FILE, json_encode($allProducts));
 
-            if ($active === 0) {
-                Logger::divider();
-                if (!$nextpage) break;
-                continue;
-            }
+            Logger::info(count($products) . ' producten (totaal: ' . count($allProducts) . ')' . ($nextpage ? '' : '  (laatste pagina)'));
+            Logger::divider();
 
-            Logger::info('Prijzen ophalen voor ' . $active . ' producten...');
-            $priceMap = SolarApi::getPrices(array_column($products, 'sap'));
-            Logger::info('Prijzen ontvangen: ' . count($priceMap) . ' / ' . $active);
+            if (!$nextpage) break;
+        }
+
+        $this->state->set('fetch_done', true);
+        $this->state->save();
+        Logger::ok('Fase 1 klaar — ' . count($allProducts) . ' producten opgeslagen');
+        return true;
+    }
+
+    // ── Fase 2: verwerk alle producten naar WooCommerce ───────────────────────
+
+    private function processWooCommerce(): void
+    {
+        Logger::section('Fase 2: WooCommerce synchronisatie');
+
+        $allProducts = json_decode(file_get_contents(PRODUCTS_FILE), true) ?? [];
+        $total       = count($allProducts);
+        $offset      = (int)$this->state->get('wc_offset');
+
+        Logger::info("$total producten te verwerken" . ($offset > 0 ? " (hervatten vanaf #$offset)" : ''));
+
+        $chunks    = array_chunk(array_slice($allProducts, $offset), PAGE_LIMIT);
+        $chunkNum  = 0;
+
+        foreach ($chunks as $chunk) {
+            $chunkNum++;
+            $chunkOffset  = $offset + ($chunkNum - 1) * PAGE_LIMIT;
+
+            Logger::info('Prijzen ophalen voor ' . count($chunk) . ' producten...');
+            $priceMap   = SolarApi::getPrices(array_column($chunk, 'sap'));
+            Logger::info('Prijzen ontvangen: ' . count($priceMap) . ' / ' . count($chunk));
 
             $productMap = $toCreate = $toUpdate = [];
             $skipped    = 0;
 
-            foreach ($products as $p) {
+            foreach ($chunk as $p) {
                 $price = $priceMap[$p['sap']] ?? null;
                 if ($price === null) { $skipped++; continue; }
 
@@ -628,19 +676,19 @@ class Sync
                 $this->state->inc('skipped', $skipped);
             }
 
-            $pageCreated = $pageUpdated = $pageErrors = 0;
+            $chunkCreated = $chunkUpdated = $chunkErrors = 0;
 
-            foreach (array_chunk($toCreate, WC_BATCH) as $i => $chunk) {
-                $total = (int)ceil(count($toCreate) / WC_BATCH);
-                Logger::info(sprintf('  Create batch %d/%d (%d stuks)', $i + 1, $total, count($chunk)));
-                $r = WooCommerceApi::createBatch($chunk);
+            foreach (array_chunk($toCreate, WC_BATCH) as $i => $batch) {
+                $batchTotal = (int)ceil(count($toCreate) / WC_BATCH);
+                Logger::info(sprintf('  Create batch %d/%d (%d stuks)', $i + 1, $batchTotal, count($batch)));
+                $r = WooCommerceApi::createBatch($batch);
 
                 foreach ($r['new_ids'] as $sku => $id) {
                     $sku = (string)$sku;
                     $this->cache->set($sku, $id, $productMap[$sku]['p']['last_changed'] ?? 0);
                 }
-                $pageCreated += $r['created'];
-                $pageErrors  += count($r['errors']);
+                $chunkCreated += $r['created'];
+                $chunkErrors  += count($r['errors']);
                 foreach ($r['errors'] as $err) Logger::warn("  WC: $err");
 
                 if (!empty($r['duplicate_skus'])) {
@@ -652,49 +700,68 @@ class Sync
                             $this->cache->set($sku, $id, $productMap[$sku]['p']['last_changed'] ?? 0);
                             $retry[] = WooCommerceApi::buildUpdatePayload($id, $productMap[$sku]['price']);
                         } else {
-                            $pageErrors++;
+                            $chunkErrors++;
                             Logger::warn("  SKU $sku: duplicate maar niet gevonden in WC");
                         }
                     }
                     foreach (array_chunk($retry, WC_BATCH) as $rb) {
                         $ru = WooCommerceApi::updateBatch($rb);
-                        $pageUpdated += $ru['updated'];
-                        $pageErrors  += count($ru['errors']);
+                        $chunkUpdated += $ru['updated'];
+                        $chunkErrors  += count($ru['errors']);
                         foreach ($ru['errors'] as $err) Logger::warn("  WC: $err");
                     }
                 }
             }
 
-            foreach (array_chunk($toUpdate, WC_BATCH) as $i => $chunk) {
-                $total = (int)ceil(count($toUpdate) / WC_BATCH);
-                Logger::info(sprintf('  Update batch %d/%d (%d stuks)', $i + 1, $total, count($chunk)));
-                $r = WooCommerceApi::updateBatch($chunk);
-                $pageUpdated += $r['updated'];
-                $pageErrors  += count($r['errors']);
+            foreach (array_chunk($toUpdate, WC_BATCH) as $i => $batch) {
+                $batchTotal = (int)ceil(count($toUpdate) / WC_BATCH);
+                Logger::info(sprintf('  Update batch %d/%d (%d stuks)', $i + 1, $batchTotal, count($batch)));
+                $r = WooCommerceApi::updateBatch($batch);
+                $chunkUpdated += $r['updated'];
+                $chunkErrors  += count($r['errors']);
                 foreach ($r['errors'] as $err) Logger::warn("  WC: $err");
             }
 
             $this->cache->save();
-            $this->state->inc('created', $pageCreated);
-            $this->state->inc('updated', $pageUpdated);
-            $this->state->inc('wc_errors', $pageErrors);
+            $this->state->inc('created', $chunkCreated);
+            $this->state->inc('updated', $chunkUpdated);
+            $this->state->inc('wc_errors', $chunkErrors);
+            $this->state->set('wc_offset', $chunkOffset + count($chunk));
             $this->state->save();
 
             Logger::ok(sprintf(
-                'Pagina %d — aangemaakt: %d  bijgewerkt: %d%s',
-                $pageNum, $pageCreated, $pageUpdated,
-                $pageErrors > 0 ? "  fouten: $pageErrors" : ''
+                'Chunk %d — aangemaakt: %d  bijgewerkt: %d%s',
+                $chunkNum, $chunkCreated, $chunkUpdated,
+                $chunkErrors > 0 ? "  fouten: $chunkErrors" : ''
             ));
             Logger::divider();
-
-            if (!$nextpage) break;
         }
+    }
+
+    // ── Hoofdflow ─────────────────────────────────────────────────────────────
+
+    public function run(): void
+    {
+        Logger::info('Catalog : ' . Env::get('CATALOG_ID') . '  Land: ' . Env::get('COUNTRY_CODE'));
+        Logger::info('WC URL  : ' . Env::get('WC_URL'));
+        Logger::info('Cache   : ' . $this->cache->count() . ' bekende producten');
+
+        SolarApi::token();
+
+        if (!$this->state->get('fetch_done')) {
+            if (!$this->fetchAllProducts()) {
+                return;
+            }
+        } else {
+            Logger::ok('Fase 1 al voltooid — direct naar WooCommerce synchronisatie');
+        }
+
+        $this->processWooCommerce();
 
         Logger::section('Sync klaar');
         $started  = $this->state->get('started_at') ?? date('Y-m-d H:i:s');
         $duration = time() - strtotime($started);
         Logger::ok(sprintf('Duur         : %02d:%02d:%02d', intdiv($duration, 3600), intdiv($duration % 3600, 60), $duration % 60));
-        Logger::ok(sprintf("Pagina's     : %d", $this->state->get('page')));
         Logger::ok(sprintf('Aangemaakt   : %d', $this->state->get('created')));
         Logger::ok(sprintf('Bijgewerkt   : %d', $this->state->get('updated')));
         Logger::ok(sprintf('Overgeslagen : %d', $this->state->get('skipped')));
@@ -702,6 +769,7 @@ class Sync
             Logger::warn(sprintf('WC fouten    : %d', $this->state->get('wc_errors')));
         }
 
+        @unlink(PRODUCTS_FILE);
         $this->state->delete();
     }
 }
@@ -714,6 +782,7 @@ if (in_array('--reset', $args, true)) {
     @unlink(STATE_FILE);
     @unlink(LOG_FILE);
     @unlink(CACHE_FILE);
+    @unlink(PRODUCTS_FILE);
 }
 
 file_put_contents(LOG_FILE, '');
