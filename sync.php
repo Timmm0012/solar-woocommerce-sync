@@ -1,6 +1,7 @@
 #!/usr/bin/env php
 <?php
 declare(strict_types=1);
+ini_set('memory_limit', '512M');
 
 // php sync.php          normale run (hervat als state.json bestaat)
 // php sync.php --reset  opnieuw beginnen (wist state, cache en log)
@@ -225,6 +226,7 @@ class SolarApi
 
         $headersRaw = substr($response, 0, $headerSize);
         $bodyRaw    = substr($response, $headerSize);
+        unset($response); // geef het grote response-object vrij
 
         if ($status < 200 || $status >= 300) {
             self::$lastErrorStatus = $status;
@@ -237,8 +239,10 @@ class SolarApi
         if (preg_match('/[?&]nextpage=([^&>\s]+)/i', $headersRaw, $m)) {
             $next = $m[1];
         }
+        unset($headersRaw);
 
         $body  = json_decode($bodyRaw, true) ?? [];
+        unset($bodyRaw); // geef de raw JSON-string vrij na het decoderen
         $items = isset($body[0])
             ? $body
             : ($body['products']['product'] ?? $body['products'] ?? $body['items'] ?? []);
