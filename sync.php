@@ -454,7 +454,7 @@ class WooCommerceApi
         ];
 
         if ($p['description'] !== '') $payload['description']  = $p['description'];
-        if ($p['gtin'] !== '')        $payload['meta_data'][]  = ['key' => '_gtin', 'value' => $p['gtin']];
+        if ($p['gtin'] !== '')        $payload['meta_data'][]  = ['key' => '_global_unique_id', 'value' => $p['gtin']];
         if ($p['mpn'] !== '')         $payload['meta_data'][]  = ['key' => '_mpn',  'value' => $p['mpn']];
         if ($p['weight'] !== '' && $p['weight'] !== '0') $payload['weight'] = $p['weight'];
 
@@ -470,14 +470,16 @@ class WooCommerceApi
         return $payload;
     }
 
-    public static function buildUpdatePayload(int $wcId, float $price): array
+    public static function buildUpdatePayload(int $wcId, float $price, array $p = []): array
     {
         $prices = self::fakePrices($price);
+        $meta   = [['key' => '_solar_last_sync', 'value' => date('Y-m-d H:i:s')]];
+        if (!empty($p['gtin'])) $meta[] = ['key' => '_global_unique_id', 'value' => $p['gtin']];
         return [
             'id'            => $wcId,
             'regular_price' => $prices['regular'],
             'sale_price'    => $prices['sale'],
-            'meta_data'     => [['key' => '_solar_last_sync', 'value' => date('Y-m-d H:i:s')]],
+            'meta_data'     => $meta,
         ];
     }
 }
@@ -712,7 +714,7 @@ class Sync
             $productMap[$p['sku']] = ['p' => $p, 'price' => $price];
             $wcId = $this->cache->getId($p['sku']);
             if ($wcId) {
-                $toUpdate[] = WooCommerceApi::buildUpdatePayload($wcId, $price);
+                $toUpdate[] = WooCommerceApi::buildUpdatePayload($wcId, $price, $p);
             } else {
                 $toCreate[] = WooCommerceApi::buildCreatePayload($p, $price);
             }
@@ -743,7 +745,7 @@ class Sync
                     $id = WooCommerceApi::getIdBySku($sku);
                     if ($id) {
                         $this->cache->set($sku, $id, $productMap[$sku]['p']['last_changed'] ?? 0);
-                        $retry[] = WooCommerceApi::buildUpdatePayload($id, $productMap[$sku]['price']);
+                        $retry[] = WooCommerceApi::buildUpdatePayload($id, $productMap[$sku]['price'], $productMap[$sku]['p']);
                     } else {
                         $errors++;
                         Logger::warn("    SKU $sku: duplicate maar niet gevonden");
