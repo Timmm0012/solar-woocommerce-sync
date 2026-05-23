@@ -12,10 +12,11 @@ const CACHE_FILE      = __DIR__ . '/sku_cache.json';
 const LOG_FILE        = __DIR__ . '/sync.log';
 const SOLAR_TOKEN_URL = 'https://sgidp.b2clogin.com/sgidp.onmicrosoft.com/b2c_1a_client_credentials/oauth2/v2.0/token';
 const SOLAR_API_BASE  = 'https://api.solar.eu/procurement/V1';
-const PRICE_BATCH     = 50;
-const WC_BATCH        = 50;
-const PAGE_LIMIT      = 1000;
-const MAX_ERRORS      = 3;
+const PRICE_BATCH      = 50;
+const WC_BATCH         = 100;
+const PARALLEL_BATCHES = 4;
+const PAGE_LIMIT       = 1000;
+const MAX_ERRORS       = 3;
 const PRODUCTS_FILE   = __DIR__ . '/products.jsonl';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -437,6 +438,112 @@ class WooCommerceApi
         return ['regular' => (string)$regularPrice, 'sale' => (string)$price];
     }
 
+    public static function createBatchMulti(array $chunks): array
+    {
+        if (empty($chunks)) return [];
+        $mh      = curl_multi_init();
+        $handles = [];
+        $url     = self::url('products/batch');
+        $hdrs    = array_merge(['Content-Type: application/json', 'Accept: application/json'], self::headers());
+
+        foreach ($chunks as $i => $chunk) {
+            $ch = curl_init($url);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT        => 300,
+                CURLOPT_POST           => true,
+                CURLOPT_POSTFIELDS     => json_encode(['create' => $chunk]),
+                CURLOPT_HTTPHEADER     => $hdrs,
+            ]);
+            curl_multi_add_handle($mh, $ch);
+            $handles[$i] = ['ch' => $ch, 'chunk' => $chunk];
+        }
+
+        do { curl_multi_exec($mh, $running); if ($running) curl_multi_select($mh); } while ($running > 0);
+
+        $results = [];
+        foreach ($handles as $i => $h) {
+            $body    = (string)curl_multi_getcontent($h['ch']);
+            $status  = curl_getinfo($h['ch'], CURLINFO_HTTP_CODE);
+            curl_multi_remove_handle($mh, $h['ch']);
+
+            if ($status < 200 || $status >= 300) {
+                $results[$i] = ['created' => 0, 'new_ids' => [], 'duplicate_skus' => [], 'errors' => [
+                    "WC batch HTTP $status: " . substr($body, 0, 200),
+                ]];
+                continue;
+            }
+
+            $decoded       = json_decode($body, true);
+            $newIds        = $duplicateSkus = $errors = [];
+            foreach (($decoded['create'] ?? []) as $idx => $item) {
+                $sku = (string)($h['chunk'][$idx]['sku'] ?? '');
+                if (!empty($item['id'])) {
+                    $newIds[$sku] = (int)$item['id'];
+                } elseif (!empty($item['error'])) {
+                    $code = strtolower($item['error']['code'] ?? '');
+                    $msg  = strtolower($item['error']['message'] ?? '');
+                    if (str_contains($code, 'sku') || str_contains($code, 'duplicate') || str_contains($msg, 'sku') || str_contains($msg, 'already')) {
+                        $duplicateSkus[] = $sku;
+                    } else {
+                        $errors[] = "Create $sku: " . ($item['error']['message'] ?? $code);
+                    }
+                }
+            }
+            $results[$i] = ['created' => count($newIds), 'new_ids' => $newIds, 'duplicate_skus' => $duplicateSkus, 'errors' => $errors];
+        }
+        curl_multi_close($mh);
+        return $results;
+    }
+
+    public static function updateBatchMulti(array $chunks): array
+    {
+        if (empty($chunks)) return [];
+        $mh      = curl_multi_init();
+        $handles = [];
+        $url     = self::url('products/batch');
+        $hdrs    = array_merge(['Content-Type: application/json', 'Accept: application/json'], self::headers());
+
+        foreach ($chunks as $i => $chunk) {
+            $ch = curl_init($url);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT        => 300,
+                CURLOPT_POST           => true,
+                CURLOPT_POSTFIELDS     => json_encode(['update' => $chunk]),
+                CURLOPT_HTTPHEADER     => $hdrs,
+            ]);
+            curl_multi_add_handle($mh, $ch);
+            $handles[$i] = $ch;
+        }
+
+        do { curl_multi_exec($mh, $running); if ($running) curl_multi_select($mh); } while ($running > 0);
+
+        $results = [];
+        foreach ($handles as $i => $ch) {
+            $body    = (string)curl_multi_getcontent($ch);
+            $status  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_multi_remove_handle($mh, $ch);
+
+            if ($status < 200 || $status >= 300) {
+                $results[$i] = ['updated' => 0, 'errors' => ["WC batch HTTP $status: " . substr($body, 0, 200)]];
+                continue;
+            }
+
+            $decoded   = json_decode($body, true);
+            $errors    = [];
+            foreach (($decoded['update'] ?? []) as $item) {
+                if (!empty($item['error'])) {
+                    $errors[] = 'Update ID ' . ($item['id'] ?? '?') . ': ' . ($item['error']['message'] ?? json_encode($item['error']));
+                }
+            }
+            $succeeded = count(array_filter($decoded['update'] ?? [], fn($x) => empty($x['error'])));
+            $results[$i] = ['updated' => $succeeded, 'errors' => $errors];
+        }
+        curl_multi_close($mh);
+        return $results;
+    }
+
     public static function buildCreatePayload(array $p, float $price): array
     {
         $prices  = self::fakePrices($price);
@@ -725,51 +832,75 @@ class Sync
 
         $created = $updated = $errors = 0;
 
-        $createTotal = (int)ceil(count($toCreate) / WC_BATCH);
-        foreach (array_chunk($toCreate, WC_BATCH) as $i => $batch) {
-            $t = microtime(true);
-            Logger::info(sprintf('  [CREATE %d/%d] %d stuks...', $i + 1, $createTotal, count($batch)));
-            $r = WooCommerceApi::createBatch($batch);
+        $createChunks = array_chunk($toCreate, WC_BATCH);
+        $createTotal  = count($createChunks);
 
-            foreach ($r['new_ids'] as $sku => $id) {
-                $sku = (string)$sku;
-                $this->cache->set($sku, $id, $productMap[$sku]['p']['last_changed'] ?? 0);
-            }
-            $created += $r['created'];
-            $errors  += count($r['errors']);
-            foreach ($r['errors'] as $err) Logger::warn("    fout: $err");
+        foreach (array_chunk($createChunks, PARALLEL_BATCHES) as $gIdx => $group) {
+            $from = $gIdx * PARALLEL_BATCHES + 1;
+            $to   = min($from + count($group) - 1, $createTotal);
+            $t    = microtime(true);
+            Logger::info(sprintf('  [CREATE %d-%d/%d] %d×%d stuks parallel...',
+                $from, $to, $createTotal, count($group), WC_BATCH));
 
-            if (!empty($r['duplicate_skus'])) {
-                $retry = [];
+            $results = WooCommerceApi::createBatchMulti($group);
+            $gCreated = $gErrors = 0;
+            $retryPayloads = [];
+
+            foreach ($results as $r) {
+                foreach ($r['new_ids'] as $sku => $id) {
+                    $sku = (string)$sku;
+                    $this->cache->set($sku, $id, $productMap[$sku]['p']['last_changed'] ?? 0);
+                }
+                $gCreated += $r['created'];
+                $gErrors  += count($r['errors']);
+                foreach ($r['errors'] as $err) Logger::warn("    fout: $err");
+
                 foreach ($r['duplicate_skus'] as $sku) {
                     $id = WooCommerceApi::getIdBySku($sku);
                     if ($id) {
                         $this->cache->set($sku, $id, $productMap[$sku]['p']['last_changed'] ?? 0);
-                        $retry[] = WooCommerceApi::buildUpdatePayload($id, $productMap[$sku]['price'], $productMap[$sku]['p']);
+                        $retryPayloads[] = WooCommerceApi::buildUpdatePayload($id, $productMap[$sku]['price'], $productMap[$sku]['p']);
                     } else {
-                        $errors++;
+                        $gErrors++;
                         Logger::warn("    SKU $sku: duplicate maar niet gevonden");
                     }
                 }
-                foreach (array_chunk($retry, WC_BATCH) as $rb) {
-                    $ru = WooCommerceApi::updateBatch($rb);
+            }
+
+            if (!empty($retryPayloads)) {
+                $retryResults = WooCommerceApi::updateBatchMulti(array_chunk($retryPayloads, WC_BATCH));
+                foreach ($retryResults as $ru) {
                     $updated += $ru['updated'];
-                    $errors  += count($ru['errors']);
+                    $gErrors += count($ru['errors']);
                     foreach ($ru['errors'] as $err) Logger::warn("    fout: $err");
                 }
             }
-            Logger::info(sprintf('    → aangemaakt: %d  fouten: %d  %.1fs', $r['created'], count($r['errors']), microtime(true) - $t));
+
+            $created += $gCreated;
+            $errors  += $gErrors;
+            Logger::info(sprintf('    → aangemaakt: %d  fouten: %d  %.1fs', $gCreated, $gErrors, microtime(true) - $t));
         }
 
-        $updateTotal = (int)ceil(count($toUpdate) / WC_BATCH);
-        foreach (array_chunk($toUpdate, WC_BATCH) as $i => $batch) {
-            $t = microtime(true);
-            Logger::info(sprintf('  [UPDATE %d/%d] %d stuks...', $i + 1, $updateTotal, count($batch)));
-            $r = WooCommerceApi::updateBatch($batch);
-            $updated += $r['updated'];
-            $errors  += count($r['errors']);
-            foreach ($r['errors'] as $err) Logger::warn("    fout: $err");
-            Logger::info(sprintf('    → bijgewerkt: %d  fouten: %d  %.1fs', $r['updated'], count($r['errors']), microtime(true) - $t));
+        $updateChunks = array_chunk($toUpdate, WC_BATCH);
+        $updateTotal  = count($updateChunks);
+
+        foreach (array_chunk($updateChunks, PARALLEL_BATCHES) as $gIdx => $group) {
+            $from = $gIdx * PARALLEL_BATCHES + 1;
+            $to   = min($from + count($group) - 1, $updateTotal);
+            $t    = microtime(true);
+            Logger::info(sprintf('  [UPDATE %d-%d/%d] %d×%d stuks parallel...',
+                $from, $to, $updateTotal, count($group), WC_BATCH));
+
+            $results = WooCommerceApi::updateBatchMulti($group);
+            $gUpdated = $gErrors = 0;
+            foreach ($results as $r) {
+                $gUpdated += $r['updated'];
+                $gErrors  += count($r['errors']);
+                foreach ($r['errors'] as $err) Logger::warn("    fout: $err");
+            }
+            $updated += $gUpdated;
+            $errors  += $gErrors;
+            Logger::info(sprintf('    → bijgewerkt: %d  fouten: %d  %.1fs', $gUpdated, $gErrors, microtime(true) - $t));
         }
 
         $this->cache->save();
