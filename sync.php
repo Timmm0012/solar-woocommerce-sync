@@ -12,12 +12,20 @@ const CACHE_FILE      = __DIR__ . '/sku_cache.json';
 const LOG_FILE        = __DIR__ . '/sync.log';
 const SOLAR_TOKEN_URL = 'https://sgidp.b2clogin.com/sgidp.onmicrosoft.com/b2c_1a_client_credentials/oauth2/v2.0/token';
 const SOLAR_API_BASE  = 'https://api.solar.eu/procurement/V1';
-const PRICE_BATCH      = 50;
+const PRICE_BATCH      = 50; 
 const WC_BATCH         = 100;
 const PARALLEL_BATCHES = 8;
 const PAGE_LIMIT       = 1000;
 const MAX_ERRORS       = 3;
 const PRODUCTS_FILE   = __DIR__ . '/products.jsonl';
+
+// ── Categorieën om te synchroniseren ─────────────────────────────────────────
+// Solar category ID => naam die in WooCommerce wordt aangemaakt/gebruikt
+const SYNC_CATEGORIES = [
+    2385772 => 'Aluminiumkabel',
+    1295840 => 'Luidsprekersnoer',
+    // 9876543 => 'Verlichtingsarmaturen',
+];
 
 // ─────────────────────────────────────────────────────────────────────────────
 
