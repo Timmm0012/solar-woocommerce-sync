@@ -677,7 +677,10 @@ class WooCommerceApi
         $catName = SYNC_CATEGORIES[$p['category_id'] ?? 0] ?? null;
         if ($catName !== null) {
             $wcCatId = self::ensureCategory($catName);
-            if ($wcCatId > 0) $payload['categories'] = [['id' => $wcCatId]];
+            if ($wcCatId > 0) {
+                $payload['categories'] = [['id' => $wcCatId]];
+                Logger::info("  Product toegevoegd: SKU {$p['sku']} — categorie \"{$catName}\"");
+            }
         }
 
         return $payload;
