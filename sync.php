@@ -14,7 +14,7 @@ const SOLAR_TOKEN_URL = 'https://sgidp.b2clogin.com/sgidp.onmicrosoft.com/b2c_1a
 const SOLAR_API_BASE  = 'https://api.solar.eu/procurement/V1';
 const PRICE_BATCH      = 50;
 const WC_BATCH         = 100;
-const PARALLEL_BATCHES = 4;
+const PARALLEL_BATCHES = 8;
 const PAGE_LIMIT       = 1000;
 const MAX_ERRORS       = 3;
 const PRODUCTS_FILE   = __DIR__ . '/products.jsonl';
@@ -248,9 +248,16 @@ class SolarApi
             ? $body
             : ($body['products']['product'] ?? $body['products'] ?? $body['items'] ?? []);
 
+        $allowedCategories = array_filter(array_map('intval', explode(',', Env::get('CATEGORY_IDS', ''))));
+
         $products = [];
         foreach ($items as $item) {
             if ((string)($item['ProductStatus'] ?? '') === '40') continue;
+
+            if (!empty($allowedCategories)) {
+                $catId = (int)($item['CategoryId'] ?? $item['categoryId'] ?? 0);
+                if (!in_array($catId, $allowedCategories, true)) continue;
+            }
 
             $sap = trim($item['SapMaterialNumber'] ?? '');
             $sku = trim($item['ElectricalNo'] ?? '');
@@ -297,29 +304,49 @@ class SolarApi
     {
         if (empty($sapNumbers)) return [];
 
-        $priceMap = [];
-        foreach (array_chunk($sapNumbers, PRICE_BATCH) as $batch) {
-            $result = Http::post(
-                SOLAR_API_BASE . '/products/prices?accountId=' . Env::get('ACCOUNT_ID') . '&countrycode=' . Env::get('COUNTRY_CODE'),
-                [
+        $chunks  = array_chunk($sapNumbers, PRICE_BATCH);
+        $baseUrl = SOLAR_API_BASE . '/products/prices?accountId=' . Env::get('ACCOUNT_ID') . '&countrycode=' . Env::get('COUNTRY_CODE');
+        $hdrs    = array_merge(['Content-Type: application/json', 'Accept: application/json'], self::headers());
+
+        $mh      = curl_multi_init();
+        $handles = [];
+
+        foreach ($chunks as $i => $batch) {
+            $ch = curl_init($baseUrl);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT        => 30,
+                CURLOPT_POST           => true,
+                CURLOPT_POSTFIELDS     => json_encode([
                     'productIdentifier' => 'SAPMaterialNumber',
                     'products'          => array_map(fn($id) => ['productId' => (string)$id], $batch),
-                ],
-                self::headers(),
-                30
-            );
+                ]),
+                CURLOPT_HTTPHEADER => $hdrs,
+            ]);
+            curl_multi_add_handle($mh, $ch);
+            $handles[$i] = ['ch' => $ch, 'count' => count($batch)];
+        }
 
-            if (!$result['ok']) {
-                Logger::warn("Prijzen HTTP {$result['status']} voor batch van " . count($batch) . ' producten — overgeslagen');
+        do { curl_multi_exec($mh, $running); if ($running) curl_multi_select($mh); } while ($running > 0);
+
+        $priceMap = [];
+        foreach ($handles as $h) {
+            $body   = (string)curl_multi_getcontent($h['ch']);
+            $status = curl_getinfo($h['ch'], CURLINFO_HTTP_CODE);
+            curl_multi_remove_handle($mh, $h['ch']);
+
+            if ($status < 200 || $status >= 300) {
+                Logger::warn("Prijzen HTTP $status voor batch van {$h['count']} producten — overgeslagen");
                 continue;
             }
 
-            foreach ((array)$result['body'] as $item) {
+            foreach ((array)json_decode($body, true) as $item) {
                 $sap   = (string)($item['ProductId'] ?? $item['productId'] ?? '');
                 $price = self::resolvePrice($item['Prices'] ?? $item['prices'] ?? []);
                 if ($sap !== '' && $price !== null) $priceMap[$sap] = $price;
             }
         }
+        curl_multi_close($mh);
 
         return $priceMap;
     }
@@ -346,9 +373,73 @@ class SolarApi
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+class RemoteStore
+{
+    private const SKU = '__solar_sync__';
+    private static ?int $id = null;
+
+    public static function load(): void
+    {
+        $r = Http::get(
+            WooCommerceApi::url('products') . '?sku=' . urlencode(self::SKU) . '&per_page=1&status=any',
+            WooCommerceApi::headers(), 15
+        );
+        foreach ($r['body'] ?? [] as $p) {
+            self::$id = (int)$p['id'];
+        }
+    }
+
+    public static function loadState(): ?array
+    {
+        if (!self::$id) return null;
+        $r = Http::get(WooCommerceApi::url('products/' . self::$id), WooCommerceApi::headers(), 15);
+        foreach ($r['body']['meta_data'] ?? [] as $m) {
+            if ($m['key'] === '_solar_state') {
+                $decoded = json_decode($m['value'], true);
+                return is_array($decoded) ? $decoded : null;
+            }
+        }
+        return null;
+    }
+
+    public static function saveState(array $state): void
+    {
+        $meta = [['key' => '_solar_state', 'value' => json_encode($state)]];
+        if (self::$id) {
+            Http::post(WooCommerceApi::url('products/' . self::$id), ['meta_data' => $meta], WooCommerceApi::headers(), 15);
+        } else {
+            $r = Http::post(WooCommerceApi::url('products'), [
+                'name'               => 'Solar Sync State',
+                'sku'                => self::SKU,
+                'status'             => 'private',
+                'catalog_visibility' => 'hidden',
+                'meta_data'          => $meta,
+            ], WooCommerceApi::headers(), 30);
+            self::$id = (int)($r['body']['id'] ?? 0) ?: null;
+        }
+    }
+
+    public static function delete(): void
+    {
+        if (!self::$id) return;
+        $ch = curl_init(WooCommerceApi::url('products/' . self::$id . '?force=true'));
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 15,
+            CURLOPT_CUSTOMREQUEST  => 'DELETE',
+            CURLOPT_HTTPHEADER     => WooCommerceApi::headers(),
+        ]);
+        curl_exec($ch);
+        curl_close($ch);
+        self::$id = null;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 class WooCommerceApi
 {
-    private static function headers(): array
+    public static function headers(): array
     {
         return [
             'Authorization: Basic ' . base64_encode(Env::get('WC_KEY') . ':' . Env::get('WC_SECRET')),
@@ -356,7 +447,7 @@ class WooCommerceApi
         ];
     }
 
-    private static function url(string $path): string
+    public static function url(string $path): string
     {
         return rtrim(Env::get('WC_URL'), '/') . '/wp-json/wc/v3/' . ltrim($path, '/');
     }
@@ -632,9 +723,15 @@ class SyncState
 
     public function __construct(bool $fresh = false)
     {
-        $this->data = (!$fresh && file_exists(STATE_FILE))
-            ? (json_decode(file_get_contents(STATE_FILE), true) ?? $this->defaults())
-            : $this->defaults();
+        if ($fresh) { $this->data = $this->defaults(); return; }
+
+        if (file_exists(STATE_FILE)) {
+            $this->data = json_decode(file_get_contents(STATE_FILE), true) ?? $this->defaults();
+        } else {
+            $remote = RemoteStore::loadState();
+            $this->data = $remote ?? $this->defaults();
+            if ($remote) Logger::ok('State hersteld vanuit WooCommerce (nieuwe container)');
+        }
     }
 
     private function defaults(): array
@@ -658,7 +755,12 @@ class SyncState
     public function set(string $key, mixed $v): void { $this->data[$key] = $v; }
     public function inc(string $key, int $by = 1): void { $this->data[$key] = ($this->data[$key] ?? 0) + $by; }
 
-    public function save(): void   { file_put_contents(STATE_FILE, json_encode($this->data, JSON_PRETTY_PRINT)); }
+    public function save(bool $remote = false): void
+    {
+        file_put_contents(STATE_FILE, json_encode($this->data, JSON_PRETTY_PRINT));
+        if ($remote) RemoteStore::saveState($this->data);
+    }
+
     public function delete(): void { @unlink(STATE_FILE); }
 }
 
@@ -908,7 +1010,7 @@ class Sync
         $this->state->inc('updated', $updated);
         $this->state->inc('wc_errors', $errors);
         $this->state->set('wc_offset', $chunkOffset + count($chunk));
-        $this->state->save();
+        $this->state->save(true); // ook remote opslaan zodat timeout geen voortgang verliest
 
         Logger::ok(sprintf('Groep %d klaar — aangemaakt: %d  bijgewerkt: %d%s',
             $chunkNum, $created, $updated, $errors > 0 ? "  fouten: $errors" : ''));
@@ -919,26 +1021,40 @@ class Sync
 
     public function run(): void
     {
-        Logger::info('Catalog : ' . Env::get('CATALOG_ID') . '  Land: ' . Env::get('COUNTRY_CODE'));
-        Logger::info('WC URL  : ' . Env::get('WC_URL'));
-        Logger::info('Cache   : ' . $this->cache->count() . ' bekende producten');
+        Logger::info('Catalog    : ' . Env::get('CATALOG_ID') . '  Land: ' . Env::get('COUNTRY_CODE'));
+        Logger::info('WC URL     : ' . Env::get('WC_URL'));
+        Logger::info('Cache      : ' . $this->cache->count() . ' bekende producten');
+        $catFilter = Env::get('CATEGORY_IDS', '');
+        Logger::info('Categories : ' . ($catFilter !== '' ? $catFilter : 'alle (geen filter)'));
 
         SolarApi::token();
 
-        if (!$this->state->get('fetch_done')) {
-            if (!$this->fetchAllProducts()) {
-                return;
+        // Fase 1: producten ophalen van Solar
+        // Als state hersteld is vanuit WooCommerce maar products.jsonl ontbreekt: opnieuw fetchen
+        $needsFetch = !$this->state->get('fetch_done')
+            || ($this->state->get('fetch_done') && !file_exists(PRODUCTS_FILE));
+
+        if ($needsFetch) {
+            if ($this->state->get('fetch_done') && !file_exists(PRODUCTS_FILE)) {
+                Logger::warn('products.jsonl ontbreekt (nieuwe container) — opnieuw ophalen van Solar...');
+                $this->state->set('fetch_done', false);
+                $this->state->set('page', 0);
+                $this->state->set('nextpage', null);
+                $this->state->set('total_fetched', 0);
             }
+            if (!$this->fetchAllProducts()) return;
         } else {
-            Logger::ok('Fase 1 al voltooid — direct naar WooCommerce');
+            Logger::ok('Fase 1 al voltooid — overgeslagen');
         }
 
-        $this->processWooCommerce();
+        // Fase 2: producten aanmaken/bijwerken in WooCommerce (inclusief afbeeldingen)
+        if ((int)$this->state->get('wc_offset') < (int)$this->state->get('total_fetched')) {
+            $this->processWooCommerce();
+        } else {
+            Logger::ok('Fase 2 al voltooid — overgeslagen');
+        }
 
         Logger::section('Sync klaar');
-        $started  = $this->state->get('started_at') ?? date('Y-m-d H:i:s');
-        $duration = time() - strtotime($started);
-        Logger::ok(sprintf('Duur         : %02d:%02d:%02d', intdiv($duration, 3600), intdiv($duration % 3600, 60), $duration % 60));
         Logger::ok(sprintf('Aangemaakt   : %d', $this->state->get('created')));
         Logger::ok(sprintf('Bijgewerkt   : %d', $this->state->get('updated')));
         Logger::ok(sprintf('Overgeslagen : %d', $this->state->get('skipped')));
@@ -948,10 +1064,13 @@ class Sync
 
         @unlink(PRODUCTS_FILE);
         $this->state->delete();
+        RemoteStore::delete();
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+Env::load(__DIR__ . '/.env');
 
 $args = array_slice($argv, 1);
 
@@ -960,12 +1079,15 @@ if (in_array('--reset', $args, true)) {
     @unlink(LOG_FILE);
     @unlink(CACHE_FILE);
     @unlink(PRODUCTS_FILE);
+    Env::require('WC_URL', 'WC_KEY', 'WC_SECRET');
+    RemoteStore::load();
+    RemoteStore::delete();
+    Logger::info('Reset voltooid (inclusief remote state in WooCommerce)');
 }
 
 file_put_contents(LOG_FILE, '');
 
 if (in_array('--dump', $args, true)) {
-    Env::load(__DIR__ . '/.env');
     Env::require('CLIENT_ID', 'CLIENT_SECRET', 'ACCOUNT_ID', 'COUNTRY_CODE', 'CATALOG_ID');
     SolarApi::token();
 
@@ -988,8 +1110,10 @@ if (in_array('--dump', $args, true)) {
     exit(0);
 }
 
-Env::load(__DIR__ . '/.env');
 Env::require('CLIENT_ID', 'CLIENT_SECRET', 'ACCOUNT_ID', 'COUNTRY_CODE', 'CATALOG_ID', 'WC_URL', 'WC_KEY', 'WC_SECRET');
+
+// State laden vanuit WooCommerce (overleeft Render container restarts)
+RemoteStore::load();
 
 Logger::section('Solar → WooCommerce Sync');
 (new Sync())->run();
