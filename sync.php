@@ -256,7 +256,7 @@ class SolarApi
             ? $body
             : ($body['products']['product'] ?? $body['products'] ?? $body['items'] ?? []);
 
-        $allowedCategories = array_filter(array_map('intval', explode(',', Env::get('CATEGORY_IDS', ''))));
+        $allowedCategories = array_keys(SYNC_CATEGORIES);
 
         $products = [];
         foreach ($items as $item) {
@@ -1032,8 +1032,9 @@ class Sync
         Logger::info('Catalog    : ' . Env::get('CATALOG_ID') . '  Land: ' . Env::get('COUNTRY_CODE'));
         Logger::info('WC URL     : ' . Env::get('WC_URL'));
         Logger::info('Cache      : ' . $this->cache->count() . ' bekende producten');
-        $catFilter = Env::get('CATEGORY_IDS', '');
-        Logger::info('Categories : ' . ($catFilter !== '' ? $catFilter : 'alle (geen filter)'));
+        foreach (SYNC_CATEGORIES as $id => $name) {
+            Logger::info("Categorie  : $name (Solar ID: $id)");
+        }
 
         SolarApi::token();
 
