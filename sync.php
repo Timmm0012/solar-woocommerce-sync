@@ -302,6 +302,7 @@ class SolarApi
                 'images'       => $images,
                 'attributes'   => $attributes,
                 'last_changed' => (int)($item['LastChanged'] ?? 0),
+                'category_id'  => (int)($item['CategoryId'] ?? $item['categoryId'] ?? 0),
             ];
         }
 
@@ -673,6 +674,12 @@ class WooCommerceApi
         if (!empty($attrs)) $payload['attributes'] = $attrs;
         if (!empty($p['images'])) $payload['images'] = array_map(fn($url) => ['src' => $url], $p['images']);
 
+        $catName = SYNC_CATEGORIES[$p['category_id'] ?? 0] ?? null;
+        if ($catName !== null) {
+            $wcCatId = self::ensureCategory($catName);
+            if ($wcCatId > 0) $payload['categories'] = [['id' => $wcCatId]];
+        }
+
         return $payload;
     }
 
@@ -687,6 +694,31 @@ class WooCommerceApi
             'sale_price'    => $prices['sale'],
             'meta_data'     => $meta,
         ];
+    }
+
+    private static array $catCache = [];
+
+    public static function ensureCategory(string $name): int
+    {
+        if (isset(self::$catCache[$name])) return self::$catCache[$name];
+
+        $r = Http::get(self::url('products/categories') . '?search=' . urlencode($name) . '&per_page=10', self::headers(), 15);
+        foreach ($r['body'] ?? [] as $cat) {
+            if (strtolower((string)($cat['name'] ?? '')) === strtolower($name)) {
+                Logger::info("WC categorie gevonden: \"$name\" (ID: {$cat['id']})");
+                return self::$catCache[$name] = (int)$cat['id'];
+            }
+        }
+
+        $r = Http::post(self::url('products/categories'), ['name' => $name], self::headers(), 15);
+        $id = (int)($r['body']['id'] ?? 0);
+        if ($id > 0) {
+            Logger::ok("WC categorie aangemaakt: \"$name\" (ID: $id)");
+            return self::$catCache[$name] = $id;
+        }
+
+        Logger::warn("WC categorie aanmaken mislukt voor \"$name\"");
+        return 0;
     }
 }
 
@@ -1100,21 +1132,29 @@ if (in_array('--dump', $args, true)) {
     Env::require('CLIENT_ID', 'CLIENT_SECRET', 'ACCOUNT_ID', 'COUNTRY_CODE', 'CATALOG_ID');
     SolarApi::token();
 
-    $nextpage = null;
-    $product  = null;
-    do {
-        $result   = SolarApi::getPage($nextpage);
-        $nextpage = $result[1] ?? null;
-        if (!empty($result[0])) { $product = $result[0][0]; break; }
-    } while ($nextpage);
+    $url = SOLAR_API_BASE . '/catalogs/' . rawurlencode(Env::get('CATALOG_ID')) . '/products'
+         . '?countrycode=' . Env::get('COUNTRY_CODE') . '&limit=1000';
 
-    echo PHP_EOL;
-    if ($product) {
-        foreach ($product as $key => $value) {
-            printf("  %-20s %s\n", $key, substr(is_array($value) ? json_encode($value) : (string)$value, 0, 120));
-        }
-    } else {
-        echo 'Geen actief product gevonden.' . PHP_EOL;
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 60,
+        CURLOPT_HTTPHEADER     => ['Authorization: Bearer ' . SolarApi::token(), 'Accept: application/json'],
+    ]);
+    $items = json_decode(curl_exec($ch), true) ?? [];
+
+    // Tel producten per categoryId
+    $counts = [];
+    foreach ($items as $item) {
+        $catId = (string)($item['CategoryId'] ?? $item['categoryId'] ?? '0');
+        $counts[$catId] = ($counts[$catId] ?? 0) + 1;
+    }
+    arsort($counts);
+
+    echo PHP_EOL . sprintf("  %d producten op pagina 1 — categoryId verdeling:" . PHP_EOL, count($items));
+    foreach ($counts as $catId => $count) {
+        $marker = isset(SYNC_CATEGORIES[(int)$catId]) ? '  ← ' . SYNC_CATEGORIES[(int)$catId] : '';
+        printf("  categoryId %-12s  %d producten%s\n", $catId, $count, $marker);
     }
     exit(0);
 }
