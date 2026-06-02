@@ -18,14 +18,7 @@ const PARALLEL_BATCHES = 8;
 const PAGE_LIMIT       = 1000;
 const MAX_ERRORS       = 3;
 const PRODUCTS_FILE   = __DIR__ . '/products.jsonl';
-
-// ── Categorieën om te synchroniseren ─────────────────────────────────────────
-// Solar category ID => naam die in WooCommerce wordt aangemaakt/gebruikt
-const SYNC_CATEGORIES = [
-    2385772 => 'Aluminiumkabel',
-    1295840 => 'Luidsprekersnoer',
-    // 9876543 => 'Verlichtingsarmaturen',
-];
+const CATEGORIES_FILE = __DIR__ . '/categories.json';
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -393,8 +386,8 @@ class RemoteStore
             WooCommerceApi::url('products') . '?sku=' . urlencode(self::SKU) . '&per_page=1&status=any',
             WooCommerceApi::headers(), 15
         );
-        foreach ($r['body'] ?? [] as $p) {
-            self::$id = (int)$p['id'];
+        foreach (is_array($r['body']) ? $r['body'] : [] as $p) {
+            if (is_array($p) && !empty($p['id'])) self::$id = (int)$p['id'];
         }
     }
 
@@ -673,15 +666,6 @@ class WooCommerceApi
         }
         if (!empty($attrs)) $payload['attributes'] = $attrs;
         if (!empty($p['images'])) $payload['images'] = array_map(fn($url) => ['src' => $url], $p['images']);
-
-        $catName = SYNC_CATEGORIES[$p['category_id'] ?? 0] ?? null;
-        if ($catName !== null) {
-            $wcCatId = self::ensureCategory($catName);
-            if ($wcCatId > 0) {
-                $payload['categories'] = [['id' => $wcCatId]];
-                Logger::info("  Product toegevoegd: SKU {$p['sku']} — categorie \"{$catName}\"");
-            }
-        }
 
         return $payload;
     }
@@ -1115,6 +1099,20 @@ class Sync
 // ─────────────────────────────────────────────────────────────────────────────
 
 Env::load(__DIR__ . '/.env');
+
+// ── Categorieën laden vanuit categories.json ──────────────────────────────────
+if (!file_exists(CATEGORIES_FILE)) {
+    fwrite(STDERR, '[ERROR]    categories.json niet gevonden naast sync.php' . PHP_EOL);
+    exit(1);
+}
+$_rawCats  = json_decode(file_get_contents(CATEGORIES_FILE), true) ?? [];
+$_syncCats = [];
+foreach ($_rawCats as $_id => $_name) {
+    $_syncCats[(int)$_id] = (string)$_name;
+}
+define('SYNC_CATEGORIES', $_syncCats);
+unset($_rawCats, $_syncCats, $_id, $_name);
+// ─────────────────────────────────────────────────────────────────────────────
 
 $args = array_slice($argv, 1);
 
