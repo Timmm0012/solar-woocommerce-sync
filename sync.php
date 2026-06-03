@@ -391,11 +391,20 @@ class RemoteStore
         }
     }
 
+    private static ?array $cachedMeta = null;
+
+    private static function fetchMeta(): array
+    {
+        if (!self::$id) return [];
+        if (self::$cachedMeta !== null) return self::$cachedMeta;
+        $r = Http::get(WooCommerceApi::url('products/' . self::$id), WooCommerceApi::headers(), 30);
+        self::$cachedMeta = is_array($r['body']['meta_data'] ?? null) ? $r['body']['meta_data'] : [];
+        return self::$cachedMeta;
+    }
+
     public static function loadState(): ?array
     {
-        if (!self::$id) return null;
-        $r = Http::get(WooCommerceApi::url('products/' . self::$id), WooCommerceApi::headers(), 15);
-        foreach ($r['body']['meta_data'] ?? [] as $m) {
+        foreach (self::fetchMeta() as $m) {
             if ($m['key'] === '_solar_state') {
                 $decoded = json_decode($m['value'], true);
                 return is_array($decoded) ? $decoded : null;
@@ -404,8 +413,48 @@ class RemoteStore
         return null;
     }
 
+    public static function loadCache(): array
+    {
+        $chunks = [];
+        $count  = 0;
+        foreach (self::fetchMeta() as $m) {
+            if ($m['key'] === '_solar_sku_cache_count') {
+                $count = (int)$m['value'];
+            } elseif (str_starts_with((string)$m['key'], '_solar_sku_cache_')) {
+                $idx = (int)substr($m['key'], strlen('_solar_sku_cache_'));
+                $chunks[$idx] = json_decode($m['value'], true) ?? [];
+            }
+        }
+        $result = [];
+        for ($i = 0; $i < $count; $i++) $result += $chunks[$i] ?? [];
+        return $result;
+    }
+
+    public static function clearState(): void
+    {
+        if (!self::$id) return;
+        Http::post(
+            WooCommerceApi::url('products/' . self::$id),
+            ['meta_data' => [['key' => '_solar_state', 'value' => '']]],
+            WooCommerceApi::headers(), 15
+        );
+    }
+
+    public static function saveCache(array $data): void
+    {
+        if (!self::$id) return;
+        $parts  = array_chunk($data, 5000, true);
+        $meta   = [['key' => '_solar_sku_cache_count', 'value' => (string)count($parts)]];
+        foreach ($parts as $i => $chunk) {
+            $meta[] = ['key' => '_solar_sku_cache_' . $i, 'value' => json_encode($chunk)];
+        }
+        self::$cachedMeta = null;
+        Http::post(WooCommerceApi::url('products/' . self::$id), ['meta_data' => $meta], WooCommerceApi::headers(), 60);
+    }
+
     public static function saveState(array $state): void
     {
+        self::$cachedMeta = null;
         $meta = [['key' => '_solar_state', 'value' => json_encode($state)]];
         if (self::$id) {
             Http::post(WooCommerceApi::url('products/' . self::$id), ['meta_data' => $meta], WooCommerceApi::headers(), 15);
@@ -456,14 +505,15 @@ class WooCommerceApi
 
     public static function getIdBySku(string $sku): ?int
     {
-        foreach (['any', 'publish', 'draft', 'private', 'pending', 'trash'] as $status) {
-            $result = Http::get(
-                self::url('products') . '?sku=' . urlencode($sku) . '&per_page=1&status=' . $status,
-                self::headers(),
-                15
-            );
-            $id = $result['body'][0]['id'] ?? null;
-            if ($id) return (int)$id;
+        $result = Http::get(
+            self::url('products') . '?sku=' . urlencode($sku) . '&per_page=1&status=any',
+            self::headers(),
+            15
+        );
+        if (is_array($result['body'])) {
+            foreach ($result['body'] as $p) {
+                if (is_array($p) && !empty($p['id'])) return (int)$p['id'];
+            }
         }
         return null;
     }
@@ -735,6 +785,15 @@ class SkuCache
     {
         $this->data[$sku] = ['id' => $wcId, 'lc' => $lastChanged];
     }
+
+    public function mergeRemote(array $remote): void
+    {
+        foreach ($remote as $sku => $entry) {
+            if (!isset($this->data[$sku])) $this->data[$sku] = $entry;
+        }
+    }
+
+    public function export(): array { return $this->data; }
 
     public function save(): void
     {
@@ -1050,6 +1109,12 @@ class Sync
     {
         Logger::info('Catalog    : ' . Env::get('CATALOG_ID') . '  Land: ' . Env::get('COUNTRY_CODE'));
         Logger::info('WC URL     : ' . Env::get('WC_URL'));
+        $remoteCache = RemoteStore::loadCache();
+        if (!empty($remoteCache)) {
+            $this->cache->mergeRemote($remoteCache);
+            Logger::ok('SKU cache hersteld vanuit WooCommerce: ' . count($remoteCache) . ' producten');
+        }
+
         Logger::info('Cache      : ' . $this->cache->count() . ' bekende producten');
         foreach (SYNC_CATEGORIES as $id => $name) {
             Logger::info("Categorie  : $name (Solar ID: $id)");
@@ -1090,9 +1155,12 @@ class Sync
             Logger::warn(sprintf('WC fouten    : %d', $this->state->get('wc_errors')));
         }
 
+        Logger::info('SKU cache opslaan in WooCommerce...');
+        RemoteStore::saveCache($this->cache->export());
+
         @unlink(PRODUCTS_FILE);
         $this->state->delete();
-        RemoteStore::delete();
+        RemoteStore::clearState();
     }
 }
 
