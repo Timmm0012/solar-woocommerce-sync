@@ -6,5 +6,6 @@ RUN docker-php-ext-install curl 2>/dev/null || true \
 
 WORKDIR /app
 COPY sync.php .
+COPY categories.json .
 
 CMD ["php", "sync.php", "--reset"]
