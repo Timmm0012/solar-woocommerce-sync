@@ -541,7 +541,7 @@ class WooCommerceApi
                 $msg  = strtolower($item['error']['message'] ?? '');
                 if (str_contains($code, 'sku') || str_contains($code, 'duplicate')
                     || str_contains($msg, 'sku') || str_contains($msg, 'already')) {
-                    $duplicateSkus[] = $sku;
+                    $duplicateSkus[] = ['sku' => $sku, 'wc_code' => $item['error']['code'] ?? '', 'wc_msg' => $item['error']['message'] ?? ''];
                 } else {
                     $errors[] = "Create $sku: " . ($item['error']['message'] ?? $code);
                 }
@@ -627,7 +627,7 @@ class WooCommerceApi
                     $code = strtolower($item['error']['code'] ?? '');
                     $msg  = strtolower($item['error']['message'] ?? '');
                     if (str_contains($code, 'sku') || str_contains($code, 'duplicate') || str_contains($msg, 'sku') || str_contains($msg, 'already')) {
-                        $duplicateSkus[] = $sku;
+                        $duplicateSkus[] = ['sku' => $sku, 'wc_code' => $item['error']['code'] ?? '', 'wc_msg' => $item['error']['message'] ?? ''];
                     } else {
                         $errors[] = "Create $sku: " . ($item['error']['message'] ?? $code);
                     }
@@ -980,12 +980,17 @@ class Sync
             $batch = [];
         };
 
+        $seenSkus = [];
         while (($line = fgets($fh)) !== false) {
             $p = json_decode(trim($line), true);
-            if ($p) $batch[] = $p;
+            if ($p && isset($p['sku']) && !isset($seenSkus[$p['sku']])) {
+                $seenSkus[$p['sku']] = true;
+                $batch[] = $p;
+            }
             $lineNum++;
             if (count($batch) >= PAGE_LIMIT) $flush();
         }
+        unset($seenSkus);
         $flush();
 
         fclose($fh);
@@ -1043,14 +1048,15 @@ class Sync
                 $gErrors  += count($r['errors']);
                 foreach ($r['errors'] as $err) Logger::warn("    fout: $err");
 
-                foreach ($r['duplicate_skus'] as $sku) {
+                foreach ($r['duplicate_skus'] as $dup) {
+                    $sku = $dup['sku'];
+                    Logger::warn("    SKU $sku: WC-fout [{$dup['wc_code']}] {$dup['wc_msg']}");
                     $id = WooCommerceApi::getIdBySku($sku);
                     if ($id) {
                         $this->cache->set($sku, $id, $productMap[$sku]['p']['last_changed'] ?? 0);
                         $retryPayloads[] = WooCommerceApi::buildUpdatePayload($id, $productMap[$sku]['price'], $productMap[$sku]['p']);
                     } else {
-                        $gErrors++;
-                        Logger::warn("    SKU $sku: duplicate maar niet gevonden");
+                        Logger::warn("    SKU $sku: niet gevonden via REST — wordt overgeslagen (volgende run via cache)");
                     }
                 }
             }
@@ -1184,7 +1190,8 @@ unset($_rawCats, $_syncCats, $_id, $_name);
 
 $args = array_slice($argv, 1);
 
-if (in_array('--reset', $args, true)) {
+if (in_array('--full-reset', $args, true)) {
+    // Verwijdert alles: state, cache, log én het WooCommerce hidden product (inclusief SKU cache)
     @unlink(STATE_FILE);
     @unlink(LOG_FILE);
     @unlink(CACHE_FILE);
@@ -1192,7 +1199,16 @@ if (in_array('--reset', $args, true)) {
     Env::require('WC_URL', 'WC_KEY', 'WC_SECRET');
     RemoteStore::load();
     RemoteStore::delete();
-    Logger::info('Reset voltooid (inclusief remote state in WooCommerce)');
+    Logger::info('Full-reset voltooid (inclusief remote state en cache in WooCommerce)');
+} elseif (in_array('--reset', $args, true)) {
+    // Wist alleen de sync-state zodat de volgende run opnieuw begint; SKU cache blijft bewaard
+    @unlink(STATE_FILE);
+    @unlink(LOG_FILE);
+    @unlink(PRODUCTS_FILE);
+    Env::require('WC_URL', 'WC_KEY', 'WC_SECRET');
+    RemoteStore::load();
+    RemoteStore::clearState();
+    Logger::info('Reset voltooid (state gewist, SKU cache bewaard)');
 }
 
 file_put_contents(LOG_FILE, '');

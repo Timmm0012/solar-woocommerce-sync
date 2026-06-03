@@ -8,4 +8,4 @@ WORKDIR /app
 COPY sync.php .
 COPY categories.json .
 
-CMD ["php", "sync.php", "--reset"]
+CMD ["php", "sync.php"]
